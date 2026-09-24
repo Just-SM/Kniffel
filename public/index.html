@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101418">
+  <title>Kniffel</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B2%text%3E%3C/svg%3E">
+  <style>
+__SHEET_CSS__
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <button id="burger" class="burger" type="button" hidden>☰</button>
+      <h1>Kniffel</h1>
+      <span id="conn-dot" class="dot off"></span>
+    </header>
+
+    <div id="conn-banner" class="banner" hidden>
+      Live sync is failing. Check your Wi-Fi connection, then reload this page.
+    </div>
+
+    <div id="join-view">
+      <p>Score sheet for real dice on the table.</p>
+      <form id="join-form">
+        <input id="name-input" type="text" maxlength="20" placeholder="Your name" autocomplete="off" required>
+        <button type="submit" class="btn primary">Sit down</button>
+      </form>
+      <div id="join-error" class="error"></div>
+    </div>
+
+    <div id="game-view" hidden>
+      <div id="lobby">
+        <div id="players-note"></div>
+        <div id="table-visual"></div>
+        <div class="opt-row" id="opt-turns-row">
+          <label class="opt">
+            <input type="checkbox" id="opt-turns">
+            <span>Enforce turns (clockwise by seat)</span>
+          </label>
+        </div>
+        <div class="opt-row">
+          <label class="opt">
+            <input type="checkbox" id="opt-one-device">
+            <span>One device mode (shared phone)</span>
+          </label>
+        </div>
+        <div class="opt-row" id="device-add-row" style="display:none">
+          <div id="device-players"></div>
+          <div class="dev-add">
+            <input id="device-add-name" type="text" maxlength="20" placeholder="Player name" autocomplete="off">
+            <button id="device-add-btn" class="btn" type="button">+ Add on this device</button>
+          </div>
+        </div>
+        <button id="start-btn" class="btn primary">Start game</button>
+      </div>
+
+      <div id="play" hidden>
+        <div id="dev-bar" hidden>
+          <button id="dev-prev" class="dev-btn" type="button">‹</button>
+          <div id="dev-name">—</div>
+          <button id="dev-next" class="dev-btn" type="button">›</button>
+        </div>
+        <div id="turn-banner" hidden></div>
+        <button id="undo-turn-btn" class="btn undo-btn" type="button" hidden>↩ Undo last turn</button>
+        <div id="quick-strip" hidden>
+          <div id="quick-standings"></div>
+          <button id="peek-btn" class="q-peek" type="button">👁</button>
+        </div>
+      </div>
+
+      <button id="reset-btn" class="btn" hidden>New game</button>
+
+      <div id="standings-view"></div>
+      <div id="leaderboard-view"></div>
+      <div id="history-view"></div>
+      <div id="sheet"></div>
+    </div>
+
+    <div id="drawer-backdrop" hidden></div>
+    <nav id="drawer" hidden>
+      <button class="drawer-item active" data-view="sheet" type="button">
+        <svg class="d-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 3h12a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M3 7h14M3 10h14M3 13h14"/></svg>
+        Sheet
+      </button>
+      <button class="drawer-item" data-view="leaderboard" type="button">
+        <svg class="d-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 3h6l-1 4H8L7 3zM4 3h3v2H4v3H2V5a2 2 0 0 1 2-2zM16 3h-3v2h3v3h2V5a2 2 0 0 0-2-2zM10 14c-2.5 0-4 1-4 3v1h8v-1c0-2-1.5-3-4-3z"/></svg>
+        Leaderboard
+      </button>
+      <button class="drawer-item" data-view="history" type="button">
+        <svg class="d-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 3h12v14H4V3z"/><path d="M7 7h6M7 10h6M7 13h4"/></svg>
+        History
+      </button>
+      <button id="drawer-reset-btn" class="drawer-item drawer-reset drawer-danger" type="button">
+        <svg class="d-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 10a6 6 0 1 1 2 4.47"/><path d="M4 10h4M6 8V4"/></svg>
+        New game
+      </button>
+      <button id="drawer-reset-table-btn" class="drawer-item drawer-danger" type="button">
+        <svg class="d-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 3H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h3"/><path d="M12 6l4 4-4 4M16 10H8"/></svg>
+        Reset table
+      </button>
+    </nav>
+
+    <div id="picker" class="modal" hidden>
+      <div class="modal-card">
+        <h2 id="picker-title">Category</h2>
+        <div id="picker-values"></div>
+        <button id="picker-cancel" class="btn">Cancel</button>
+      </div>
+    </div>
+
+    <div id="win-overlay" class="modal" hidden>
+      <div class="modal-card win-card">
+        <div id="win-head"></div>
+        <div id="win-chart"></div>
+        <div id="win-standings"></div>
+        <div id="win-stats"></div>
+        <button id="win-new-game" class="btn">New game</button>
+        <button id="win-reset-table" class="btn danger">Reset table</button>
+        <button id="win-close" class="btn primary">Back to sheet</button>
+      </div>
+    </div>
+
+    <div id="fx-toasts"></div>
+
+    <div id="fx-big" hidden>
+      <div id="fx-rain"></div>
+      <div id="fx-big-in"></div>
+    </div>
+  </div>
+
+  <script>
+__SHEET_JS__
+  </script>
+</body>
+</html>
