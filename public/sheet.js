@@ -382,6 +382,7 @@ function applyState(s) {
   state = s;
   handleFx(prev, state);
   render(prev);
+  updateDiceUI();
   if (picker.open) {
     if (!state.players.some((p) => p.id === state.you)) closePicker();
     else renderPickerValues();
@@ -481,6 +482,12 @@ $('#opt-turns').addEventListener('change', async (e) => {
 
 $('#opt-one-device').addEventListener('change', async (e) => {
   const res = await api('config', { oneDevice: e.target.checked });
+  if (res && res.state) applyState(res.state);
+  else if (res && !res.ok) { alert(res.error); e.target.checked = !e.target.checked; }
+});
+
+$('#opt-virtual-dice').addEventListener('change', async (e) => {
+  const res = await api('config', { virtualDice: e.target.checked });
   if (res && res.state) applyState(res.state);
   else if (res && !res.ok) { alert(res.error); e.target.checked = !e.target.checked; }
 });
@@ -1278,6 +1285,7 @@ function render(prev) {
     $('#opt-turns').checked = !!state.config.enforceTurns;
     $('#opt-turns-row').style.display = state.players.length >= 2 ? '' : 'none';
     $('#opt-one-device').checked = !!state.oneDevice;
+    $('#opt-virtual-dice').checked = !!state.config.virtualDice;
     $('#device-add-row').style.display = state.oneDevice ? '' : 'none';
     renderDeviceList();
     renderTable();
@@ -1530,5 +1538,629 @@ function cbox(tag, cls, text) {
   if (text) d.textContent = text;
   return d;
 }
+
+// ---------- virtual dice ----------
+const DICE_COUNT = 5;
+const DICE_MAX_ROLLS = 3;
+const DIE_SIZE = 0.85; // world units; compact dice, plenty of table around them
+const DIE_HALF = DIE_SIZE / 2;
+let threePromise = null;
+let diceScene = null;
+let diceOpen = false;
+let diceAutoKey = null;
+const diceModel = {
+  values: [1, 1, 1, 1, 1],
+  kept: [false, false, false, false, false],
+  rolls: 0,
+  rolling: false,
+};
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.async = true;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error(src + ' failed to load'));
+    document.head.appendChild(s);
+  });
+}
+
+function loadThree() {
+  if (threePromise) return threePromise;
+  threePromise = (async () => {
+    if (!window.THREE) await loadScript('/vendor/three.min.js');
+    if (!window.CANNON) await loadScript('/vendor/cannon-es.js');
+    return { THREE: window.THREE, CANNON: window.CANNON };
+  })();
+  return threePromise;
+}
+
+function pipTexture(THREE, value) {
+  const S = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, S);
+  grad.addColorStop(0, '#ffffff');
+  grad.addColorStop(1, '#dde3ef');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, S, S);
+  g.strokeStyle = 'rgba(20,27,48,0.22)';
+  g.lineWidth = 6;
+  g.strokeRect(3, 3, S - 6, S - 6);
+  const P = 34;
+  const M = S / 2;
+  const Q = S - P;
+  const dots = {
+    1: [[M, M]],
+    2: [[P, P], [Q, Q]],
+    3: [[P, P], [M, M], [Q, Q]],
+    4: [[P, P], [Q, P], [P, Q], [Q, Q]],
+    5: [[P, P], [Q, P], [M, M], [P, Q], [Q, Q]],
+    6: [[P, P], [Q, P], [P, M], [Q, M], [P, Q], [Q, Q]],
+  }[value];
+  g.fillStyle = '#101826';
+  for (const [x, y] of dots) {
+    g.beginPath();
+    g.arc(x, y, 12, 0, Math.PI * 2);
+    g.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  if ('colorSpace' in tex && THREE.SRGBColorSpace) tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+function buildDiceScene(THREE, CANNON, host) {
+  host.innerHTML = '';
+  const canvas = document.createElement('canvas');
+  canvas.className = 'dice-canvas';
+  host.appendChild(canvas);
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x000000, 0);
+
+  const scene = new THREE.Scene();
+  scene.background = null; // transparent: the sheet's gradient shows through
+
+  // The world is a fixed 10-unit-tall frame; resizeDice() scales its width
+  // to the host aspect so the invisible edge walls always sit exactly at
+  // what the screen can see — dice can never escape the view.
+  const WORLD_H = 10;
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.up.set(0, 0, -1);
+  // position/lookAt are set by resizeDice() based on the host aspect
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+  const key = new THREE.DirectionalLight(0xffffff, 1.1);
+  key.position.set(3.5, 12, 4.5);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x6fe0ff, 0.45);
+  rim.position.set(-6, 6, -5);
+  scene.add(rim);
+
+  // Physics world: dice are rigid boxes; the felt is a static plane and the
+  // four edge walls are static boxes placed at the visible screen borders.
+  const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -30, 0) });
+  world.allowSleep = true;
+  world.broadphase = new CANNON.NaiveBroadphase();
+  world.solver.iterations = 12;
+
+  const dieMat = new CANNON.Material('die');
+  const feltMat = new CANNON.Material('felt');
+  const railMatC = new CANNON.Material('rail');
+  world.addContactMaterial(new CANNON.ContactMaterial(dieMat, feltMat, { friction: 0.3, restitution: 0.25 }));
+  world.addContactMaterial(new CANNON.ContactMaterial(dieMat, railMatC, { friction: 0.05, restitution: 0.6 }));
+  world.addContactMaterial(new CANNON.ContactMaterial(dieMat, dieMat, { friction: 0.12, restitution: 0.3 }));
+
+  const ground = new CANNON.Body({ mass: 0, material: feltMat, shape: new CANNON.Plane() });
+  ground.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+  world.addBody(ground);
+
+  // No visual felt: the transparent canvas lets the CSS-blurred score sheet
+  // show through, so the dice appear to roll directly on top of the app.
+
+  // Four invisible edge walls (physics only). resizeDice() slides them to
+  // whatever the camera currently frames, so dice can never leave the view.
+  // Each wall is a tall slab whose broad face looks inward.
+  const WALL_H = 14;  // tall enough to catch a die thrown upward
+  const FAR = 200;    // long extent along the wall so overlaps don't matter
+  const mkEdgeWall = (along) => {
+    const b = new CANNON.Body({ mass: 0, material: railMatC });
+    // 'x' walls run up/down the screen (broad in z), 'z' walls run across
+    const half = along === 'x'
+      ? new CANNON.Vec3(0.6, WALL_H / 2, FAR)
+      : new CANNON.Vec3(FAR, WALL_H / 2, 0.6);
+    b.addShape(new CANNON.Box(half));
+    world.addBody(b);
+    return b;
+  };
+  const edgeWalls = {
+    left: mkEdgeWall('x'),
+    right: mkEdgeWall('x'),
+    top: mkEdgeWall('z'),
+    bottom: mkEdgeWall('z'),
+  };
+
+  const geo = new THREE.BoxGeometry(DIE_SIZE, DIE_SIZE, DIE_SIZE);
+  const faceValues = [3, 4, 2, 5, 1, 6]; // BoxGeometry faces [+X,-X,+Y,-Y,+Z,-Z]
+  const mats = faceValues.map((v) =>
+    new THREE.MeshStandardMaterial({ map: pipTexture(THREE, v), roughness: 0.35, metalness: 0.05 })
+  );
+  const dieShape = new CANNON.Box(new CANNON.Vec3(DIE_HALF, DIE_HALF, DIE_HALF));
+  // Amber inverted-hull outline shown around kept dice so the selection reads
+  // at a glance. BackSide renders the slightly larger shell only where it
+  // pokes out from behind the die, giving a crisp rim.
+  const outlineMat = new THREE.MeshBasicMaterial({ color: 0xffaa2c, side: THREE.BackSide });
+
+  const dice = [];
+  for (let i = 0; i < DICE_COUNT; i++) {
+    const mesh = new THREE.Mesh(geo, mats);
+    const outline = new THREE.Mesh(geo, outlineMat);
+    outline.scale.setScalar(1.13);
+    outline.visible = false;
+    mesh.add(outline);
+    scene.add(mesh);
+    const body = new CANNON.Body({
+      mass: 1,
+      material: dieMat,
+      shape: dieShape,
+      // a small amount of damping settles micro-jitter without killing the
+      // tumble; sleep thresholds do the real "has come to rest" work
+      linearDamping: 0.05,
+      angularDamping: 0.05,
+      allowSleep: true,
+      sleepSpeedLimit: 0.35,
+      sleepTimeLimit: 0.35,
+    });
+    body.sleep();
+    world.addBody(body);
+    dice.push({ mesh, outline, body, kept: false });
+  }
+
+  diceScene = {
+    mode: '3d',
+    THREE,
+    CANNON,
+    renderer,
+    scene,
+    camera,
+    world,
+    dice,
+    faceValues,
+    edgeWalls,
+    worldH: WORLD_H,
+    running: false,
+    raf: 0,
+    last: 0,
+    raycaster: new THREE.Raycaster(),
+    pointer: new THREE.Vector2(),
+  };
+  resizeDice();
+  return diceScene;
+}
+
+function resizeDice() {
+  if (!diceScene || diceScene.mode !== '3d') return;
+  const host = $('#dice-stage');
+  const w = Math.max(1, host.clientWidth);
+  const hPx = Math.max(1, host.clientHeight);
+  diceScene.renderer.setSize(w, hPx);
+  const cam = diceScene.camera;
+  cam.aspect = w / hPx;
+
+  // Top-down orthographic-style frame: place the perspective camera high
+  // above the felt and compute the world-space rectangle it actually shows.
+  // The dice walls live exactly at those four edges, so dice stay on screen.
+  const vFov = (cam.fov * Math.PI) / 180;
+  const dist = (diceScene.worldH / 2) / Math.tan(vFov / 2);
+  cam.position.set(0, dist, 0.0001); // tiny nudge so up=(0,0,-1) is stable
+  cam.lookAt(0, 0, 0);
+  cam.updateProjectionMatrix();
+
+  const halfW = (diceScene.worldH / 2) * cam.aspect;
+  const halfD = diceScene.worldH / 2;
+  const pad = DIE_HALF + 0.05; // keep the die's center this far inside the wall
+  const ey = 7; // wall center height — slab spans 0..14 above the felt
+
+  const ew = diceScene.edgeWalls;
+  ew.left.position.set(-halfW - pad, ey, 0);
+  ew.right.position.set(halfW + pad, ey, 0);
+  ew.top.position.set(0, ey, -halfD - pad);
+  ew.bottom.position.set(0, ey, halfD + pad);
+}
+
+// Random throw: dice are poured in from just above the top edge of the
+// screen, each with its own direction, speed and spin. The physics engine
+// decides where they land and which face ends up on top.
+function startRoll() {
+  const halfW = (diceScene.worldH / 2) * diceScene.camera.aspect;
+  const halfD = diceScene.worldH / 2;
+  for (let i = 0; i < DICE_COUNT; i++) {
+    if (diceModel.kept[i]) continue;
+    const b = diceScene.dice[i].body;
+    // a kept body was parked as STATIC; make it dynamic again before throwing
+    b.type = diceScene.CANNON.Body.DYNAMIC;
+    b.wakeUp();
+    b.position.set(
+      (Math.random() * 2 - 1) * halfW * 0.7,
+      4 + i * 0.5 + Math.random() * 0.6,
+      -halfD + DIE_HALF + 0.15 // just inside the top edge
+    );
+    b.velocity.set(
+      (Math.random() * 2 - 1) * 3.5,
+      0,
+      6 + Math.random() * 4 // flung down-screen
+    );
+    b.angularVelocity.set(
+      (Math.random() - 0.5) * 40,
+      (Math.random() - 0.5) * 40,
+      (Math.random() - 0.5) * 40
+    );
+    b.quaternion.setFromEuler(
+      Math.random() * Math.PI * 2,
+      Math.random() * Math.PI * 2,
+      Math.random() * Math.PI * 2
+    );
+  }
+}
+
+// Which die face is pointing up (normal +Y). BoxGeometry face order matches
+// the material order [+X,-X,+Y,-Y,+Z,-Z]; faceValues mirrors that order.
+function readTopFace(die, THREE) {
+  let best = 0;
+  let bestY = -2;
+  for (let f = 0; f < 6; f++) {
+    const n = new THREE.Vector3(
+      f === 0 ? 1 : f === 1 ? -1 : 0,
+      f === 2 ? 1 : f === 3 ? -1 : 0,
+      f === 4 ? 1 : f === 5 ? -1 : 0
+    ).applyQuaternion(die.mesh.quaternion);
+    if (n.y > bestY) { bestY = n.y; best = f; }
+  }
+  return diceScene.faceValues[best];
+}
+
+function animateDice() {
+  if (!diceScene || diceScene.mode !== '3d') return;
+  const now = performance.now();
+  const dt = Math.min(diceScene.last ? (now - diceScene.last) / 1000 : 0.016, 0.05);
+  diceScene.last = now;
+  const world = diceScene.world;
+
+  // Fixed-step integration with interpolation keeps contacts stable even
+  // when the display refresh stutters.
+  world.step(1 / 120, dt, 10);
+
+  for (const d of diceScene.dice) {
+    if (d.kept) {
+      // Kept dice are parked on their shelf; the body is kinematic and only
+      // eases up a touch so the tap reads visually.
+      const targetY = DIE_HALF + 0.95;
+      d.mesh.position.y += (targetY - d.mesh.position.y) * Math.min(1, dt * 10);
+      continue;
+    }
+    d.mesh.position.copy(d.body.position);
+    d.mesh.quaternion.copy(d.body.quaternion);
+  }
+
+  // The roll is done when every free die has gone to sleep; then read the
+  // face that actually came up and hand it back to the game model.
+  if (diceModel.rolling) {
+    const asleep = diceScene.dice.every((d) => d.kept || d.body.sleepState === 2);
+    if (asleep) {
+      diceScene.dice.forEach((d, i) => {
+        if (!d.kept) diceModel.values[i] = readTopFace(d, diceScene.THREE);
+      });
+      diceModel.rolling = false;
+      updateDiceControls();
+    }
+  }
+
+  diceScene.renderer.render(diceScene.scene, diceScene.camera);
+  if (diceScene.running) diceScene.raf = requestAnimationFrame(animateDice);
+}
+
+function syncDiceScene() {
+  if (!diceScene) return;
+  if (diceScene.mode === '3d') {
+    const CANNON = diceScene.CANNON;
+    diceScene.dice.forEach((d, i) => {
+      d.kept = diceModel.kept[i];
+      d.outline.visible = d.kept;
+      // Park the dice in a 3+2 layout on the felt, frozen, until the next
+      // roll wakes them up.
+      const col = i % 3;
+      const row = Math.floor(i / 3);
+      const cols = row === 0 ? 3 : 2;
+      d.body.position.set(
+        (col - (cols - 1) / 2) * (DIE_SIZE * 1.2),
+        DIE_HALF,
+        (row - 0.5) * (DIE_SIZE * 1.35)
+      );
+      d.body.velocity.setZero();
+      d.body.angularVelocity.setZero();
+      d.body.quaternion.setFromEuler(
+        (Math.floor(Math.random() * 4)) * Math.PI / 2,
+        (Math.floor(Math.random() * 4)) * Math.PI / 2,
+        (Math.floor(Math.random() * 4)) * Math.PI / 2
+      );
+      d.body.sleep();
+      d.mesh.position.copy(d.body.position);
+      d.mesh.quaternion.copy(d.body.quaternion);
+    });
+  } else {
+    $('#dice-stage').classList.add('flat');
+    renderDice2D(false);
+  }
+  updateDiceControls();
+}
+
+function renderDice2D(animate) {
+  const host = $('#dice-stage');
+  host.classList.add('flat');
+  host.innerHTML = '';
+  for (let i = 0; i < DICE_COUNT; i++) {
+    const d = document.createElement('button');
+    d.type = 'button';
+    d.className = 'vd-die' + (diceModel.kept[i] ? ' kept' : '') +
+      (animate && !diceModel.kept[i] ? ' rolling' : '');
+    d.innerHTML = diceSvg(diceModel.values[i], 58);
+    d.addEventListener('click', () => toggleKeep(i));
+    host.appendChild(d);
+  }
+  if (animate) {
+    setTimeout(() => {
+      if (diceScene && diceScene.mode === '2d') {
+        for (const el of host.children) el.classList.remove('rolling');
+      }
+    }, 650);
+  }
+}
+
+function buildDiceFallback() {
+  if (diceScene && diceScene.mode === '3d') return;
+  diceScene = { mode: '2d' };
+  syncDiceScene();
+}
+
+function resetDiceModel() {
+  for (let i = 0; i < DICE_COUNT; i++) {
+    diceModel.values[i] = 1 + Math.floor(Math.random() * 6);
+    diceModel.kept[i] = false;
+  }
+  diceModel.rolls = 0;
+  diceModel.rolling = false;
+  if (diceScene && diceScene.mode === '3d') syncDiceScene();
+  else if (diceScene && diceScene.mode === '2d') renderDice2D(false);
+}
+
+function updateDiceControls() {
+  const label = $('#dice-roll-label');
+  if (label) {
+    if (diceModel.rolling) label.textContent = 'Rolling…';
+    else if (diceModel.rolls === 0) label.textContent = 'Ready to roll';
+    else if (diceModel.rolls >= DICE_MAX_ROLLS) label.textContent = 'No rolls left';
+    else label.textContent = 'Roll ' + (diceModel.rolls + 1) + ' of ' + DICE_MAX_ROLLS;
+  }
+  const rb = $('#dice-roll-btn');
+  if (rb) {
+    const allKept = diceModel.kept.every(Boolean);
+    rb.disabled = diceModel.rolling || diceModel.rolls >= DICE_MAX_ROLLS || (diceModel.rolls > 0 && allKept);
+    rb.textContent = diceModel.rolls >= DICE_MAX_ROLLS ? 'Done' : (diceModel.rolls > 0 ? 'Roll again' : 'Roll');
+  }
+  const hint = $('#dice-hint');
+  if (hint) {
+    hint.textContent = diceModel.rolls > 0 && diceModel.rolls < DICE_MAX_ROLLS
+      ? 'Tap dice to keep them, then roll again.'
+      : 'Roll the dice, then tap the ones you want to keep.';
+  }
+}
+
+function toggleKeep(i) {
+  if (diceModel.rolling) return;
+  if (diceModel.rolls <= 0 || diceModel.rolls >= DICE_MAX_ROLLS) return;
+  diceModel.kept[i] = !diceModel.kept[i];
+  if (diceScene && diceScene.mode === '3d') {
+    const d = diceScene.dice[i];
+    d.kept = diceModel.kept[i];
+    d.outline.visible = d.kept;
+    if (d.kept) {
+      // park it on its shelf, frozen until the next roll wakes it
+      d.body.sleep();
+      d.body.type = diceScene.CANNON.Body.STATIC; // keeps collision shape for other dice
+    } else {
+      d.body.type = diceScene.CANNON.Body.DYNAMIC;
+      d.body.wakeUp();
+    }
+  } else {
+    const el = $('#dice-stage').children[i];
+    if (el) el.classList.toggle('kept', diceModel.kept[i]);
+  }
+  updateDiceControls();
+}
+
+function doRoll() {
+  if (!diceOpen || diceModel.rolling) return;
+  if (diceModel.rolls >= DICE_MAX_ROLLS) return;
+  if (diceModel.rolls > 0 && diceModel.kept.every(Boolean)) return;
+  diceModel.rolls += 1;
+  if (diceScene && diceScene.mode === '3d') {
+    diceModel.rolling = true;
+    startRoll();
+  } else {
+    for (let i = 0; i < DICE_COUNT; i++) {
+      if (diceModel.kept[i]) continue;
+      diceModel.values[i] = 1 + Math.floor(Math.random() * 6);
+    }
+    renderDice2D(true);
+  }
+  updateDiceControls();
+}
+
+async function openDiceTray() {
+  diceOpen = true;
+  $('#dice-tray').hidden = false;
+  updateDiceControls();
+  updateShakeBadge();
+  // A tray open is a user gesture; hook up motion sensors where allowed.
+  enableShake();
+  try {
+    const { THREE, CANNON } = await loadThree();
+    if (!diceScene || diceScene.mode !== '3d') {
+      const prevValues = diceModel.values.slice();
+      const prevKept = diceModel.kept.slice();
+      $('#dice-stage').classList.remove('flat');
+      buildDiceScene(THREE, CANNON, $('#dice-stage'));
+      for (let i = 0; i < DICE_COUNT; i++) {
+        diceModel.values[i] = prevValues[i];
+        diceModel.kept[i] = prevKept[i];
+      }
+    }
+    if (!diceOpen) return;
+    syncDiceScene();
+    if (!diceScene.running) {
+      diceScene.running = true;
+      diceScene.last = 0;
+      resizeDice();
+      animateDice();
+    }
+  } catch (e) {
+    buildDiceFallback();
+  }
+}
+
+function closeDiceTray() {
+  diceOpen = false;
+  $('#dice-tray').hidden = true;
+  if (diceScene && diceScene.mode === '3d' && diceScene.running) {
+    diceScene.running = false;
+    cancelAnimationFrame(diceScene.raf);
+  }
+}
+
+function diceActivePlayer() {
+  if (!state || !state.started || !state.config || !state.config.virtualDice) return false;
+  if (everyoneDone()) return false;
+  if (!state.mine || !state.mine.some((p) => p.id === state.you)) return false;
+  if (state.config.enforceTurns) return state.turn === state.you;
+  return true;
+}
+
+function updateDiceUI() {
+  const active = diceActivePlayer();
+  const fab = $('#dice-fab');
+  if (fab) fab.hidden = !active;
+  if (!active) {
+    if (diceOpen) closeDiceTray();
+    if (!state || !state.started) diceAutoKey = null;
+    return;
+  }
+  // Fresh dice when the turn changes, but the window only opens on demand.
+  const key = state.config.enforceTurns ? state.turn : 'free';
+  if (key && key !== diceAutoKey) {
+    diceAutoKey = key;
+    resetDiceModel();
+  }
+}
+
+// ---------- shake to roll (DeviceMotion) ----------
+let shakeEnabled = false;
+let shakeReady = false;
+let lastShakeAt = 0;
+let prevAcc = null;   // previous acceleration vector for jerk detection
+// devicemotion fires continuously (~60 Hz); detect a sharp *change* in
+// acceleration (jerk). This works whether or not gravity is included and
+// across Android devices that report acceleration as null/zero.
+const SHAKE_JERK = 9;       // m/s^2 change between samples (~60 Hz)
+const SHAKE_COOLDOWN = 800; // ms between triggered rolls
+
+function shakeSupported() {
+  return typeof window.DeviceMotionEvent !== 'undefined';
+}
+
+async function enableShake() {
+  if (!diceActivePlayer() || !window.isSecureContext || !shakeSupported()) return false;
+  try {
+    if (typeof window.DeviceMotionEvent.requestPermission === 'function') {
+      const res = await window.DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') return false;
+    }
+    if (!shakeEnabled) {
+      window.addEventListener('devicemotion', onMotion, { passive: true });
+      shakeEnabled = true;
+    }
+    updateShakeBadge();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function onMotion(e) {
+  if (!diceOpen || !diceActivePlayer()) return;
+  // accelerationIncludingGravity is populated on essentially every device
+  // (many Androids report plain `acceleration` as all zeros). Jerk detection
+  // ignores the constant gravity offset, so this is the robust choice.
+  const grav = e.accelerationIncludingGravity;
+  const lin = e.acceleration;
+  const has = (v) => v && (v.x != null || v.y != null || v.z != null);
+  const a = has(grav) ? grav : has(lin) ? lin : null;
+  if (!a) return;
+  const cur = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
+  if (prevAcc) {
+    const dx = cur.x - prevAcc.x;
+    const dy = cur.y - prevAcc.y;
+    const dz = cur.z - prevAcc.z;
+    const jerk = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const now = Date.now();
+    if (jerk > SHAKE_JERK && now - lastShakeAt > SHAKE_COOLDOWN) {
+      lastShakeAt = now;
+      doRoll();
+    }
+  }
+  prevAcc = cur;
+}
+
+function updateShakeBadge() {
+  const badge = $('#dice-shake');
+  if (!badge) return;
+  // Only promise shake where it can actually work.
+  const canOffer = diceActivePlayer() && window.isSecureContext && shakeSupported();
+  shakeReady = canOffer;
+  badge.hidden = !canOffer;
+  if (!canOffer) return;
+  badge.textContent = shakeEnabled ? '📱 Shake to roll — on' : '📱 Shake to roll';
+  badge.style.cursor = shakeEnabled ? 'default' : 'pointer';
+}
+
+function fabClick() {
+  if (diceOpen) { closeDiceTray(); return; }
+  openDiceTray(); // this is a user gesture; it requests motion access itself
+}
+
+$('#dice-fab').addEventListener('click', fabClick);
+$('#dice-shake').addEventListener('click', () => { if (!shakeEnabled) enableShake(); });
+$('#dice-close').addEventListener('click', closeDiceTray);
+$('#dice-roll-btn').addEventListener('click', doRoll);
+$('#dice-reset-btn').addEventListener('click', () => {
+  resetDiceModel();
+  doRoll();
+});
+$('#dice-stage').addEventListener('click', (e) => {
+  if (!diceScene || diceScene.mode !== '3d' || diceModel.rolling) return;
+  const rect = diceScene.renderer.domElement.getBoundingClientRect();
+  diceScene.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  diceScene.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  diceScene.raycaster.setFromCamera(diceScene.pointer, diceScene.camera);
+  const hits = diceScene.raycaster.intersectObjects(diceScene.dice.map((d) => d.mesh));
+  if (!hits.length) return;
+  const idx = diceScene.dice.findIndex((d) => d.mesh === hits[0].object);
+  // Ignore taps on dice that are still tumbling (asleep = parked, tappable).
+  if (idx >= 0 && diceScene.dice[idx].body.sleepState === 2) toggleKeep(idx);
+});
+window.addEventListener('resize', resizeDice);
 
 refreshLoop();

@@ -47,6 +47,12 @@ __SHEET_CSS__
             <span>One device mode (shared phone)</span>
           </label>
         </div>
+        <div class="opt-row">
+          <label class="opt">
+            <input type="checkbox" id="opt-virtual-dice">
+            <span>Virtual dice (3D table dice)</span>
+          </label>
+        </div>
         <div class="opt-row" id="device-add-row" style="display:none">
           <div id="device-players"></div>
           <div class="dev-add">
@@ -72,6 +78,22 @@ __SHEET_CSS__
       </div>
 
       <button id="reset-btn" class="btn" hidden>New game</button>
+
+      <button id="dice-fab" class="dice-fab" type="button" hidden aria-label="Open dice table">🎲</button>
+
+      <div id="dice-tray" class="dice-tray" hidden>
+        <div class="dice-tray-head">
+          <span id="dice-roll-label">Roll 1 of 3</span>
+          <span id="dice-shake" class="dice-shake" hidden>📱 Shake to roll</span>
+          <button id="dice-close" class="dice-close" type="button" aria-label="Close">✕</button>
+        </div>
+        <div id="dice-stage" class="dice-stage"></div>
+        <div id="dice-hint" class="dice-hint">Roll the dice, then tap the ones you want to keep.</div>
+        <div class="dice-tray-actions">
+          <button id="dice-roll-btn" class="btn primary" type="button">Roll</button>
+          <button id="dice-reset-btn" class="btn" type="button">New roll</button>
+        </div>
+      </div>
 
       <div id="standings-view"></div>
       <div id="leaderboard-view"></div>

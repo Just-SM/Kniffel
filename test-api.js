@@ -1,7 +1,9 @@
 'use strict';
 
 // End-to-end check of the REST API (run against a live test server).
-const BASE = 'http://localhost:' + (process.env.PORT || 3199);
+// The dev server uses a self-signed certificate, so accept it for this run.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+const BASE = 'https://localhost:' + (process.env.PORT || 3199);
 
 function makePlayer(name) {
   let kid = null;
@@ -46,11 +48,18 @@ function assert(cond, label) {
   const cfg = await A.call('config', { enforceTurns: true });
   assert(cfg.ok && cfg.state.config.enforceTurns === true, 'config toggle');
 
+  const vcfg = await A.call('config', { virtualDice: true });
+  assert(vcfg.ok && vcfg.state.config.virtualDice === true, 'virtualDice config toggle');
+  assert(vcfg.state.config.enforceTurns === true, 'config toggle preserves other flags');
+
   const started = await A.call('start', {});
   assert(started.ok && started.state.started === true, 'start');
+  assert(started.state.config.virtualDice === true, 'virtualDice survives start');
 
   const locked = await A.call('config', { enforceTurns: false });
   assert(locked.ok === false, 'config locked after start');
+  const lockedDice = await A.call('config', { virtualDice: false });
+  assert(lockedDice.ok === false, 'virtualDice locked after start');
   const moved = await A.call('seat', { seat: 0 });
   assert(moved.ok === false, 'seat locked after start');
 

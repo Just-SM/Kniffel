@@ -5,11 +5,16 @@ const os = require('os');
 const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const rules = require('./rules');
 const { buildPage } = require('./page');
 const store = require('./store');
+const certs = require('./certs');
 
 const PORT = process.env.PORT || 3000;
+// HTTPS by default: a secure context is required for the phone
+// accelerometer (shake to roll). Set KNIFFEL_HTTPS=0 to serve plain HTTP.
+const USE_HTTPS = process.env.KNIFFEL_HTTPS !== '0';
 const MAX_PLAYERS = 6;
 const SEATS = MAX_PLAYERS;
 
@@ -56,7 +61,7 @@ function identity(req, res, next) {
 // Single room, exists for the whole process lifetime.
 const game = {
   started: false,
-  config: { enforceTurns: false, oneDevice: false },
+  config: { enforceTurns: false, oneDevice: false, virtualDice: false },
   turnId: null, // player id whose move it is (only used when enforceTurns)
   players: [], // { id, kid, seat, name, sheet, lastSeen }
   log: [], // scoring events of the current game, in move order
@@ -189,7 +194,7 @@ function publicState(kid) {
     mine: mine.map((p) => ({ id: p.id, name: p.name })),
     devicePlayers,
     oneDevice: game.config.oneDevice,
-    config: { enforceTurns: game.config.enforceTurns },
+    config: { enforceTurns: game.config.enforceTurns, virtualDice: game.config.virtualDice },
     turn: game.started && game.config.enforceTurns ? game.turnId : null,
     lastMover: game.started && game.log.length > 0 ? game.log[game.log.length - 1].pid : null,
     pageBuild: pageBuild(),
@@ -267,6 +272,9 @@ api.post('/config', (req, res) => {
   }
   if (typeof (req.body || {}).oneDevice === 'boolean') {
     game.config.oneDevice = req.body.oneDevice;
+  }
+  if (typeof (req.body || {}).virtualDice === 'boolean') {
+    game.config.virtualDice = req.body.virtualDice;
   }
   res.json({ ok: true, state: publicState(req.kid) });
 });
@@ -434,10 +442,9 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => { flushPast(); process.exit(0); });
 }
 
-const server = http.createServer(app);
-server.listen(PORT, '0.0.0.0', () => {
-  // Only IPv4, private LAN ranges are usable from phones; link-local
-  // (169.254.x.x) is an unconnected/virtual adapter and never reachable.
+// Only IPv4, private LAN ranges are usable from phones; link-local
+// (169.254.x.x) is an unconnected/virtual adapter and never reachable.
+function lanCandidates() {
   const candidates = [];
   for (const name of Object.keys(os.networkInterfaces())) {
     for (const net of os.networkInterfaces()[name]) {
@@ -449,20 +456,45 @@ server.listen(PORT, '0.0.0.0', () => {
     }
   }
   candidates.sort((a, b) => (b.usable ? 1 : 0) - (a.usable ? 1 : 0));
+  return candidates;
+}
 
+function printBanner(scheme, candidates) {
   console.log('');
   console.log('  Kniffel score sheet (REST polling, adblock-proof)');
-  console.log(`  This PC : http://localhost:${PORT}`);
+  console.log(`  This PC : ${scheme}://localhost:${PORT}`);
   if (candidates.length === 0) {
     console.log('  No IPv4 LAN address found - connect this PC to your Wi-Fi and restart.');
   } else {
-    console.log(`  Phones  : http://${candidates[0].addr}:${PORT}`);
+    console.log(`  Phones  : ${scheme}://${candidates[0].addr}:${PORT}`);
     if (candidates.length > 1) {
       console.log('  Other adapters (try if the first does not work):');
-      for (const c of candidates.slice(1)) console.log(`    http://${c.addr}:${PORT}  (${c.name})`);
+      for (const c of candidates.slice(1)) console.log(`    ${scheme}://${c.addr}:${PORT}  (${c.name})`);
+    }
+    if (USE_HTTPS) {
+      console.log('');
+      console.log('  TLS: the certificate is self-signed, so the browser warns once.');
+      console.log('  Accept it (Advanced -> Proceed) on every device.');
+      console.log('  For shake-to-roll on iPhone, trust the certificate fully under');
+      console.log('  Settings > General > VPN & Device Management instead of just proceeding.');
     }
     console.log('  If unreachable: allow Node.js in Windows Firewall (private networks)');
     console.log('  or run as admin once:  netsh advfirewall firewall add rule name="kniffel" dir=in action=allow protocol=TCP localport=' + PORT);
   }
   console.log('');
-});
+}
+
+const candidates = lanCandidates();
+
+if (USE_HTTPS) {
+  certs.getCert(candidates.map((c) => c.addr)).then((tls) => {
+    const server = https.createServer({ key: tls.key, cert: tls.cert }, app);
+    server.listen(PORT, '0.0.0.0', () => printBanner('https', candidates));
+  }).catch((e) => {
+    console.error('TLS setup failed:', e.message);
+    console.error('Falling back to plain HTTP (shake-to-roll will be unavailable).');
+    http.createServer(app).listen(PORT, '0.0.0.0', () => printBanner('http', candidates));
+  });
+} else {
+  http.createServer(app).listen(PORT, '0.0.0.0', () => printBanner('http', candidates));
+}
